@@ -1,0 +1,100 @@
+import pandas as pd
+import json
+import os
+import zstandard as zstd
+import io
+from datetime import datetime, timezone
+from tqdm import tqdm  # Progress bar library
+
+# Load the CSV file
+csv_file_path = 'indonesia_submissions_filtered.csv'
+csv_data = pd.read_csv(csv_file_path)
+
+# Extract the Link IDs from the CSV
+link_ids = set(csv_data['Link ID'].tolist())
+print(f"Extracted {len(link_ids)} Link IDs to be processed.")
+
+# Zstandard compressed JSON file path
+zst_file_path = 'indonesia_comments.zst'
+
+# Output file path
+output_folder = 'RedditCommentsFiltered'
+os.makedirs(output_folder, exist_ok=True)
+json_file_name, _ = os.path.splitext(os.path.basename(zst_file_path))
+output_file_name = f"{json_file_name}_filtered.csv"
+output_csv_path = os.path.join(output_folder, output_file_name)
+
+# Initialize the CSV file with headers
+with open(output_csv_path, 'w', encoding='utf-8', newline='') as csv_file:
+    pd.DataFrame(columns=["comment_id", "author", "comment", "link_id", "date_created"]).to_csv(csv_file, index=False)
+
+# Function to write a batch of comments to the CSV file
+def write_to_csv(comments):
+    pd.DataFrame(comments).to_csv(output_csv_path, mode='a', index=False, header=False)
+
+# Process the Zstandard compressed JSON file line-by-line
+try:
+    with open(zst_file_path, 'rb') as f:
+        dctx = zstd.ZstdDecompressor()
+        with dctx.stream_reader(f) as reader:
+            text_stream = io.TextIOWrapper(reader, encoding='utf-8')  # Correctly wrap the binary stream
+            
+            batch = []  # Collect comments in small batches
+            progress = tqdm(desc="Processing ZST JSON", unit="lines", mininterval=1.0)
+            visited = set()  # Keep track of processed comment IDs
+            
+            for line in text_stream:  # Iterate over decompressed lines correctly
+                try:
+                    # Decode line as JSON
+                    comment = json.loads(line.strip())
+                    comment_id = comment.get('id')
+
+                    # Skip already visited comments
+                    if comment_id in visited:
+                        continue
+
+                    link_id = comment.get('link_id')
+                    if link_id in link_ids:
+                        body = comment.get('body', '').strip().lower()
+                        if body not in ['[deleted]', '[removed]', '']:
+                            # Convert UNIX timestamp to readable format
+                            date_created = comment.get('created_utc')
+                            if date_created:
+                                date_created = datetime.fromtimestamp(date_created, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+                            else:
+                                date_created = None
+
+                            # Add the comment to the batch
+                            batch.append({
+                                "comment_id": comment_id,  # Add comment ID here
+                                "author": comment.get('author'),
+                                "comment": comment.get('body'),
+                                "link_id": link_id,  # Include submission ID
+                                "date_created": date_created
+                            })
+
+                            visited.add(comment_id)  # Mark as processed
+
+                    # Write the batch to the CSV every 10,000 lines
+                    if len(batch) >= 10000:
+                        write_to_csv(batch)
+                        batch = []  # Reset the batch to free memory
+
+                    # Update progress
+                    progress.update(1)
+
+                except json.JSONDecodeError:
+                    # Skip invalid JSON lines
+                    continue
+
+            # Write any remaining comments in the batch
+            if batch:
+                write_to_csv(batch)
+
+            progress.close()  # Close the progress bar
+
+except FileNotFoundError:
+    print(f"ZST file not found at {zst_file_path}")
+    exit()
+
+print(f"Filtered comments saved to {output_csv_path}")
